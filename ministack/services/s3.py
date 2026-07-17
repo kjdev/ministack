@@ -50,10 +50,12 @@ from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
+    get_region,
     iso_to_rfc7231,
     md5_hash,
     new_uuid,
     now_iso,
+    set_request_region,
     sha256_hash,
 )
 
@@ -1917,7 +1919,7 @@ def _fire_s3_event(
                 {
                     "eventVersion": "2.1",
                     "eventSource": "aws:s3",
-                    "awsRegion": os.environ.get("MINISTACK_REGION", "us-east-1"),
+                    "awsRegion": bucket_region,
                     "eventTime": event_time,
                     "eventName": short_event,
                     "userIdentity": {"principalId": "EXAMPLE"},
@@ -1998,9 +2000,14 @@ def _fire_s3_event(
                     "Time": event_time,
                     "Resources": [f"arn:aws:s3:::{bucket_name}"],
                     "Account": get_account_id(),
-                    "Region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+                    "Region": bucket_region,
                 }
-                _eb._dispatch_event(eb_event)
+                previous_region = get_region()
+                set_request_region(bucket_region)
+                try:
+                    _eb._dispatch_event(eb_event)
+                finally:
+                    set_request_region(previous_region)
                 logger.debug("S3→EventBridge: %s (%s) for %s/%s", detail_type, event_name, bucket_name, key)
         except Exception:
             logger.exception("S3→EventBridge delivery failed for %s/%s", bucket_name, key)
@@ -2224,6 +2231,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             "size": obj["size"],
             "is_latest": True,
             "data": body,
+            "content_type": obj.get("content_type") or "application/octet-stream",
             "storage_class": obj.get("storage_class") or "STANDARD",
             "checksums": obj.get("checksums") or {},
         })
@@ -2527,7 +2535,7 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         for v in versions:
             if v["version_id"] == version_id:
                 resp_headers = {
-                    "Content-Type": "application/octet-stream",
+                    "Content-Type": v.get("content_type") or "application/octet-stream",
                     "ETag": v["etag"],
                     "Content-Length": str(v["size"]),
                     "Last-Modified": iso_to_rfc7231(v["last_modified"]),
