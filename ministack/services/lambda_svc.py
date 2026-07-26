@@ -137,6 +137,8 @@ def _account_from_arn(arn: str) -> str:
 
 REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
+# Deprecated and ignored (#1205): in-container runs now populate the sibling
+# Lambda container via docker cp. Kept defined to avoid breaking any importer.
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 LAMBDA_DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "") or os.environ.get("LAMBDA_DOCKER_NETWORK", "")
 LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
@@ -993,6 +995,18 @@ def _normalize_endpoint_url(value: str) -> str:
     if ":" not in host:
         host = f"{host}:4566"
     return f"http://{host}"
+
+
+def _rewrite_host_for_container(url: str) -> str:
+    """Rewrite a ``localhost``/``127.0.0.1`` URL to ``host.docker.internal`` so a
+    Docker Lambda container can reach ministack on the host. Explicitly
+    configured hosts (e.g. a Docker-network name) are left untouched."""
+    if not url:
+        return url
+    for host in ("localhost", "127.0.0.1"):
+        url = url.replace(f"://{host}:", "://host.docker.internal:")
+        url = url.replace(f"://{host}/", "://host.docker.internal/")
+    return url
 
 
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
@@ -3085,6 +3099,13 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint."""
     import urllib.request
+    # A CloudFormation custom-resource ResponseURL points at ministack on the
+    # host; rewrite localhost/127.0.0.1 to host.docker.internal so the callback
+    # is reachable from inside the container (issue #1149), consistent with the
+    # AWS_ENDPOINT_URL rewrite. Without this the PUT fails with ConnectionRefused
+    # and the stack hangs on the custom resource until ServiceTimeout.
+    if isinstance(event, dict) and event.get("ResponseURL"):
+        event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
     max_attempts = int(timeout * 10) + 20
     for _attempt in range(max_attempts):
         container.reload()
@@ -3346,10 +3367,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         endpoint = f"http://host.docker.internal:{port}"
     else:
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
-        endpoint = endpoint.replace("://localhost:", "://host.docker.internal:")
-        endpoint = endpoint.replace("://localhost/", "://host.docker.internal/")
-        endpoint = endpoint.replace("://127.0.0.1:", "://host.docker.internal:")
-        endpoint = endpoint.replace("://127.0.0.1/", "://host.docker.internal/")
+        endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
     # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
@@ -3362,18 +3380,18 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     _cp_layers = bool(layers_dirs)
     mounts: list = []
     if package_type == "Zip":
-        host_code_dir = LAMBDA_DOCKER_VOLUME_MOUNT or code_dir
-        if LAMBDA_DOCKER_VOLUME_MOUNT:
-            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
-            if is_provided:
-                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
-        elif _running_in_container():
-            # DinD: host daemon can't see our tmpfs — populate via docker cp after create
+        if _running_in_container():
+            # DinD: the host Docker daemon can't see our tmpfs, so populate the
+            # runtime container's /var/task (and /var/runtime for provided) via
+            # docker cp after create. This supersedes the legacy
+            # LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT named-volume mount, which is now
+            # a deprecated no-op: it mounted the volume name as a bind path,
+            # which Docker rejects with "mount path must be absolute" (#1205).
             _use_docker_cp = True
         else:
-            mounts.append(docker_lib.types.Mount("/var/task", host_code_dir, type="bind", read_only=True))
+            mounts.append(docker_lib.types.Mount("/var/task", code_dir, type="bind", read_only=True))
             if is_provided:
-                mounts.append(docker_lib.types.Mount("/var/runtime", host_code_dir, type="bind", read_only=True))
+                mounts.append(docker_lib.types.Mount("/var/runtime", code_dir, type="bind", read_only=True))
 
     # CMD / EntryPoint
     run_kwargs: dict = {

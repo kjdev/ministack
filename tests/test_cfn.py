@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 import urllib.request
 import uuid as _uuid_mod
@@ -1915,6 +1916,85 @@ def test_cfn_ec2_launch_template(cfn, ec2):
     assert len(desc2["LaunchTemplates"]) == 0
 
 
+def test_cfn_appsync_function_configuration_attributes(cfn, appsync):
+    """AppSync pipeline functions expose the identities consumed by resolvers."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-function-{suffix}"
+    api_id = appsync.create_graphql_api(
+        name=f"pipeline-api-{suffix}",
+        authenticationType="API_KEY",
+    )["graphqlApi"]["apiId"]
+    appsync.create_data_source(
+        apiId=api_id,
+        name="NoneSource",
+        type="NONE",
+    )
+
+    def template(function_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "PipelineFunction": {
+                    "Type": "AWS::AppSync::FunctionConfiguration",
+                    "Properties": {
+                        "ApiId": api_id,
+                        "DataSourceName": "NoneSource",
+                        "Name": function_name,
+                        "FunctionVersion": "2018-05-29",
+                        "RequestMappingTemplate": "{}",
+                        "ResponseMappingTemplate": "$util.toJson($ctx.result)",
+                    },
+                },
+            },
+            "Outputs": {
+                "RefArn": {"Value": {"Ref": "PipelineFunction"}},
+                "FunctionArn": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "FunctionArn"]}
+                },
+                "FunctionId": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "FunctionId"]}
+                },
+                "FunctionName": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "Name"]}
+                },
+                "DataSourceName": {
+                    "Value": {"Fn::GetAtt": ["PipelineFunction", "DataSourceName"]}
+                },
+            },
+        }
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("ExampleFunction")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs["RefArn"] == outputs["FunctionArn"]
+        assert outputs["RefArn"].endswith(f"/functions/{outputs['FunctionId']}")
+        assert outputs["FunctionName"] == "ExampleFunction"
+        assert outputs["DataSourceName"] == "NoneSource"
+        original_arn = outputs["FunctionArn"]
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("UpdatedFunction")),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs["FunctionArn"] == original_arn
+        assert outputs["FunctionName"] == "UpdatedFunction"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        appsync.delete_graphql_api(apiId=api_id)
+
+
 def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
     """CloudFormation VPC endpoints share the EC2 API state and expose their ID."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -1962,6 +2042,7 @@ def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
     assert ec2.describe_vpc_endpoints(
         VpcEndpointIds=[outputs["RefId"]]
     )["VpcEndpoints"] == []
+
 
 def test_cfn_elbv2_load_balancer_and_listener(cfn, elbv2):
     """CloudFormation provisions ELBv2 LoadBalancer + Listener and cleans both on delete."""
@@ -4249,6 +4330,66 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     assert exc.value.response["Error"]["Code"] == "EntityNotFound"
 
 
+def test_cfn_cloudfront_origin_access_identity_attributes(cfn):
+    """CloudFront OAIs expose stable CFN identities and canonical user IDs."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cloudfront-oai-{suffix}"
+
+    def template(comment):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "OriginAccessIdentity": {
+                    "Type": "AWS::CloudFront::CloudFrontOriginAccessIdentity",
+                    "Properties": {
+                        "CloudFrontOriginAccessIdentityConfig": {
+                            "Comment": comment,
+                        },
+                    },
+                },
+            },
+            "Outputs": {
+                "OaiRef": {"Value": {"Ref": "OriginAccessIdentity"}},
+                "OaiId": {
+                    "Value": {"Fn::GetAtt": ["OriginAccessIdentity", "Id"]},
+                },
+                "CanonicalUserId": {
+                    "Value": {
+                        "Fn::GetAtt": [
+                            "OriginAccessIdentity",
+                            "S3CanonicalUserId",
+                        ],
+                    },
+                },
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("initial comment")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["OaiRef"] == outputs["OaiId"]
+    assert re.fullmatch(r"E[A-Z0-9]{13}", outputs["OaiId"])
+    assert re.fullmatch(r"[0-9a-f]{64}", outputs["CanonicalUserId"])
+
+    original_outputs = outputs
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("updated comment")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs == original_outputs
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
 def test_cfn_cloudfront_distribution_supports_invalidations(cfn, cloudfront):
     """A distribution provisioned through CloudFormation must initialize the
     invalidation state used by the native CloudFront API (#1147)."""
@@ -5060,6 +5201,77 @@ def test_cfn_apigateway_documentation_part_lifecycle(cfn, apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def test_cfn_apigateway_request_validator_identity(cfn, apigw_v1):
+    """RequestValidator exposes its ID while local requests remain permissive."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-request-validator-{suffix}"
+    api_id = apigw_v1.create_rest_api(name=f"request-validator-{suffix}")["id"]
+
+    def template(name, validate_body):
+        return {
+            "Resources": {
+                "RequestValidator": {
+                    "Type": "AWS::ApiGateway::RequestValidator",
+                    "Properties": {
+                        "RestApiId": api_id,
+                        "Name": name,
+                        "ValidateRequestBody": validate_body,
+                        "ValidateRequestParameters": True,
+                    },
+                },
+            },
+            "Outputs": {
+                "RefId": {"Value": {"Ref": "RequestValidator"}},
+                "GetAttId": {
+                    "Value": {
+                        "Fn::GetAtt": ["RequestValidator", "RequestValidatorId"]
+                    }
+                },
+            },
+        }
+
+    def physical_id():
+        detail = cfn.describe_stack_resource(
+            StackName=stack_name,
+            LogicalResourceId="RequestValidator",
+        )["StackResourceDetail"]
+        return detail["PhysicalResourceId"]
+
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("body-and-parameters", True)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        created_id = physical_id()
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+        assert outputs == {"RefId": created_id, "GetAttId": created_id}
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("body-and-parameters", False)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() == created_id
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(template("replacement", False)),
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert physical_id() != created_id
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_cfn_apigateway_documentation_version_lifecycle(cfn, apigw_v1):
     """DocumentationVersion has a stable CFN identity and supports replacement."""
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -5324,6 +5536,169 @@ def test_cfn_logs_subscription_filter_provisions(cfn, logs):
     # gone with it — describing it now raises ResourceNotFoundException.
     with pytest.raises(ClientError):
         logs.describe_subscription_filters(logGroupName="/cfn/subfilter-test")
+
+
+def test_cfn_logs_resource_policy_identity_and_lifecycle(cfn):
+    """Logs resource policies expose their policy name without enforcing it."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-policy-{suffix}"
+    policy_name = f"logs-policy-{suffix}"
+
+    def template(statement_sid, name=policy_name):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "LogsPolicy": {
+                    "Type": "AWS::Logs::ResourcePolicy",
+                    "Properties": {
+                        "PolicyName": name,
+                        "PolicyDocument": json.dumps({
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Sid": statement_sid,
+                                "Effect": "Allow",
+                                "Principal": {"Service": "route53.amazonaws.com"},
+                                "Action": "logs:PutLogEvents",
+                                "Resource": "*",
+                            }],
+                        }),
+                    },
+                },
+            },
+            "Outputs": {
+                "PolicyName": {"Value": {"Ref": "LogsPolicy"}},
+            },
+        }
+
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("InitialPolicy")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == policy_name
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("UpdatedPolicy")),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == policy_name
+
+    updated_name = f"{policy_name}-updated"
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template("UpdatedPolicy", updated_name)),
+    )
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert stack["Outputs"][0]["OutputValue"] == updated_name
+
+    cfn.delete_stack(StackName=stack_name)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_kinesisfirehose_delivery_stream_shares_firehose_state(cfn, fh):
+    """AWS::KinesisFirehose::DeliveryStream provisions through CloudFormation and
+    shares state with the Firehose API; Ref returns the name, GetAtt Arn the ARN."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-firehose-{suffix}"
+    stream_name = f"cfn-fh-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Stream": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": stream_name,
+                    "DeliveryStreamType": "DirectPut",
+                    "ExtendedS3DestinationConfiguration": {
+                        "BucketARN": "arn:aws:s3:::cfn-fh-bucket",
+                        "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                        "Prefix": "raw/",
+                    },
+                },
+            },
+        },
+        "Outputs": {
+            "RefName": {"Value": {"Ref": "Stream"}},
+            "StreamArn": {"Value": {"Fn::GetAtt": ["Stream", "Arn"]}},
+        },
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+        assert outputs["RefName"] == stream_name
+        assert outputs["StreamArn"].endswith(f":deliverystream/{stream_name}")
+
+        desc = fh.describe_delivery_stream(
+            DeliveryStreamName=stream_name
+        )["DeliveryStreamDescription"]
+        assert desc["DeliveryStreamStatus"] == "ACTIVE"
+        assert desc["DeliveryStreamARN"] == outputs["StreamArn"]
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
+
+    with pytest.raises(ClientError) as exc:
+        fh.describe_delivery_stream(DeliveryStreamName=stream_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cfn_kinesisfirehose_iceberg_destination_provisions(cfn, fh):
+    """Regression for #1206: a stack with an Iceberg-destination Firehose stream
+    no longer fails with Unsupported resource type and reaches CREATE_COMPLETE."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-fh-iceberg-{suffix}"
+    stream_name = f"cfn-fh-ice-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Stream": {
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": stream_name,
+                    "DeliveryStreamType": "DirectPut",
+                    "IcebergDestinationConfiguration": {
+                        "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                        "CatalogConfiguration": {
+                            "CatalogARN": "arn:aws:glue:us-east-1:000000000000:catalog"
+                        },
+                        "S3Configuration": {
+                            "BucketARN": "arn:aws:s3:::cfn-fh-ice-bucket",
+                            "RoleARN": "arn:aws:iam::000000000000:role/firehose-role",
+                        },
+                        "DestinationTableConfigurationList": [{
+                            "DestinationDatabaseName": "analytics",
+                            "DestinationTableName": "events",
+                            "UniqueKeys": ["id"],
+                        }],
+                    },
+                },
+            },
+        },
+        "Outputs": {"RefName": {"Value": {"Ref": "Stream"}}},
+    }
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert fh.describe_delivery_stream(
+            DeliveryStreamName=stream_name
+        )["DeliveryStreamDescription"]["DeliveryStreamStatus"] == "ACTIVE"
+    finally:
+        try:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        except ClientError:
+            pass
 
 
 def test_cfn_change_set_detects_parameter_driven_change(cfn, s3):

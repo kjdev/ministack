@@ -34,6 +34,7 @@ import ministack.services.ec2 as _ec2
 import ministack.services.ecr as _ecr
 import ministack.services.ecs as _ecs
 import ministack.services.eventbridge as _eb
+import ministack.services.firehose as _firehose
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
@@ -1198,6 +1199,25 @@ def _cwlogs_create(logical_id, props, stack_name):
 
 def _cwlogs_delete(physical_id, props):
     _cw_logs._log_groups.pop(physical_id, None)
+
+
+# --- CloudWatch Logs ResourcePolicy ---
+
+def _cwlogs_resource_policy_create(logical_id, props, stack_name):
+    policy_name = props.get("PolicyName")
+    if not policy_name:
+        raise ValueError("AWS::Logs::ResourcePolicy requires PolicyName")
+    # Local log delivery is intentionally permissive, so the policy only needs
+    # its CloudFormation identity rather than a data-plane enforcement store.
+    return policy_name, {}
+
+
+def _cwlogs_resource_policy_update(physical_id, old_props, new_props, stack_name):
+    return _cwlogs_resource_policy_create(physical_id, new_props, stack_name)
+
+
+def _cwlogs_resource_policy_delete(physical_id, props):
+    pass
 
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
@@ -2401,6 +2421,25 @@ def _apigw_documentation_part_delete(physical_id, props):
         _apigw_v1._delete_documentation_part(api_id, physical_id)
 
 
+# --- API Gateway RequestValidator ---
+
+def _apigw_request_validator_create(logical_id, props, stack_name):
+    validator_id = new_uuid().replace("-", "")[:8]
+    return validator_id, {"RequestValidatorId": validator_id}
+
+
+def _apigw_request_validator_update(physical_id, old_props, new_props, stack_name):
+    # RestApiId and Name require replacement. Validation flags update in place;
+    # request handling remains deliberately permissive in the local data plane.
+    if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Name")):
+        return _apigw_request_validator_create(physical_id, new_props, stack_name)
+    return physical_id, {"RequestValidatorId": physical_id}
+
+
+def _apigw_request_validator_delete(physical_id, props):
+    pass
+
+
 # --- API Gateway DocumentationVersion ---
 
 def _apigw_documentation_version_identity(props):
@@ -2739,6 +2778,40 @@ def _appsync_ds_delete(physical_id, props):
     parts = physical_id.split("/", 1)
     if len(parts) == 2:
         _appsync._data_sources.get(parts[0], {}).pop(parts[1], None)
+
+
+def _appsync_function_attributes(api_id, function_id, props):
+    function_arn = (
+        f"arn:aws:appsync:{get_region()}:{get_account_id()}:"
+        f"apis/{api_id}/functions/{function_id}"
+    )
+    return {
+        "DataSourceName": props.get("DataSourceName", ""),
+        "FunctionArn": function_arn,
+        "FunctionId": function_id,
+        "Name": props.get("Name", ""),
+    }
+
+
+def _appsync_function_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    function_id = new_uuid().replace("-", "")[:26]
+    attrs = _appsync_function_attributes(api_id, function_id, props)
+    # Pipeline execution remains permissive; the CFN identity and documented
+    # attributes are enough for resolvers to reference the local function.
+    return attrs["FunctionArn"], attrs
+
+
+def _appsync_function_update(physical_id, old_props, new_props, stack_name):
+    if new_props.get("ApiId") != old_props.get("ApiId"):
+        return _appsync_function_create(physical_id, new_props, stack_name)
+    function_id = physical_id.rsplit("/", 1)[-1]
+    attrs = _appsync_function_attributes(new_props.get("ApiId", ""), function_id, new_props)
+    return physical_id, attrs
+
+
+def _appsync_function_delete(physical_id, props):
+    pass
 
 
 def _appsync_resolver_create(logical_id, props, stack_name):
@@ -4601,6 +4674,38 @@ def _waf_web_acl_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# CloudFront Origin Access Identity
+# ---------------------------------------------------------------------------
+
+def _cf_oai_attributes(oai_id):
+    canonical_user_id = hashlib.sha256(
+        f"{get_account_id()}:{oai_id}".encode()
+    ).hexdigest()
+    return {"Id": oai_id, "S3CanonicalUserId": canonical_user_id}
+
+
+def _cf_oai_create(logical_id, props, stack_name):
+    config = props.get("CloudFrontOriginAccessIdentityConfig")
+    if not isinstance(config, dict):
+        raise ValueError(
+            "AWS::CloudFront::CloudFrontOriginAccessIdentity requires "
+            "CloudFrontOriginAccessIdentityConfig"
+        )
+    oai_id = _cf._dist_id()
+    return oai_id, _cf_oai_attributes(oai_id)
+
+
+def _cf_oai_update(physical_id, old_props, new_props, stack_name):
+    # Comment is mutable but local CloudFront/S3 access remains permissive, so
+    # retaining the identity is the only state required for an in-place update.
+    return physical_id, _cf_oai_attributes(physical_id)
+
+
+def _cf_oai_delete(physical_id, props):
+    pass
+
+
+# ---------------------------------------------------------------------------
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
@@ -5118,6 +5223,59 @@ def _s3tables_table_delete(physical_id, props):
     _s3tables._tables.pop(_s3tables._table_key(bucket_arn, namespace, table_name), None)
 
 
+# --- Kinesis Data Firehose DeliveryStream ---
+
+def _firehose_delivery_stream_create(logical_id, props, stack_name):
+    # CFN Properties mirror the CreateDeliveryStream API shape (destination
+    # configs, DeliveryStreamType, Tags), so pass them straight through to the
+    # existing Firehose control plane. Ref returns the stream name; Fn::GetAtt
+    # Arn returns the stream ARN.
+    name = props.get("DeliveryStreamName") or _physical_name(
+        stack_name, logical_id, max_len=64
+    )
+    data = dict(props)
+    data["DeliveryStreamName"] = name
+    status, _headers, body = _firehose._create_delivery_stream(data)
+    if status >= 400:
+        raise ValueError(
+            f"AWS::KinesisFirehose::DeliveryStream create failed: {body!r}"
+        )
+    return name, {"Arn": _firehose._stream_arn(name)}
+
+
+def _firehose_delivery_stream_update(physical_id, old_props, new_props, stack_name):
+    # DeliveryStreamName, DeliveryStreamType, and the source configs require
+    # replacement; destination configuration changes apply in place.
+    replace_keys = (
+        "DeliveryStreamName", "DeliveryStreamType",
+        "KinesisStreamSourceConfiguration", "MSKSourceConfiguration",
+    )
+    if any(new_props.get(k) != old_props.get(k) for k in replace_keys):
+        new_id, attrs = _firehose_delivery_stream_create(
+            physical_id, new_props, stack_name
+        )
+        _firehose_delivery_stream_delete(physical_id, old_props)
+        return new_id, attrs
+    stream = _firehose._streams.get(physical_id)
+    if stream is None:
+        return _firehose_delivery_stream_create(physical_id, new_props, stack_name)
+    dtype, cfg = _firehose._resolve_dest_type_and_config(new_props)
+    if dtype and cfg is not None:
+        stream["destinations"] = [{
+            "id": _firehose._next_dest_id(),
+            "type": dtype,
+            "config": cfg,
+            "records": [],
+        }]
+        stream["version"] = stream.get("version", 1) + 1
+        stream["updated_at"] = _firehose.now_epoch()
+    return physical_id, {"Arn": _firehose._stream_arn(physical_id)}
+
+
+def _firehose_delivery_stream_delete(physical_id, props):
+    _firehose._delete_delivery_stream({"DeliveryStreamName": physical_id})
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -5175,10 +5333,20 @@ _RESOURCE_HANDLERS = {
         "delete": _appconfig_deployment_delete,
     },
     "AWS::Logs::LogGroup": {"create": _cwlogs_create, "delete": _cwlogs_delete},
+    "AWS::Logs::ResourcePolicy": {
+        "create": _cwlogs_resource_policy_create,
+        "update": _cwlogs_resource_policy_update,
+        "delete": _cwlogs_resource_policy_delete,
+    },
     "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
     "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
+    "AWS::KinesisFirehose::DeliveryStream": {
+        "create": _firehose_delivery_stream_create,
+        "update": _firehose_delivery_stream_update,
+        "delete": _firehose_delivery_stream_delete,
+    },
     "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
     "AWS::Lambda::Version": {"create": _lambda_version_create},
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create},
@@ -5225,6 +5393,11 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_documentation_part_update,
         "delete": _apigw_documentation_part_delete,
     },
+    "AWS::ApiGateway::RequestValidator": {
+        "create": _apigw_request_validator_create,
+        "update": _apigw_request_validator_update,
+        "delete": _apigw_request_validator_delete,
+    },
     "AWS::ApiGateway::DocumentationVersion": {
         "create": _apigw_documentation_version_create,
         "update": _apigw_documentation_version_update,
@@ -5242,6 +5415,11 @@ _RESOURCE_HANDLERS = {
     "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
     "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
+    "AWS::AppSync::FunctionConfiguration": {
+        "create": _appsync_function_create,
+        "update": _appsync_function_update,
+        "delete": _appsync_function_delete,
+    },
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
@@ -5290,6 +5468,11 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
+    "AWS::CloudFront::CloudFrontOriginAccessIdentity": {
+        "create": _cf_oai_create,
+        "update": _cf_oai_update,
+        "delete": _cf_oai_delete,
+    },
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
     "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
