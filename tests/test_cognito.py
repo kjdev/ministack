@@ -8923,3 +8923,86 @@ def test_cognito_discovery_document_is_self_consistent_at_the_issuer_host():
     keys.add_header("Host", aws_host)
     with urllib.request.urlopen(keys) as r:
         assert "keys" in _json.loads(r.read())
+
+
+def _federation_id_claims(cid, redirect_location):
+    code = _parse_qs(urlparse(redirect_location).query)["code"][0]
+    token_data = (
+        f"grant_type=authorization_code&code={code}"
+        f"&client_id={cid}&redirect_uri=http://localhost:3000/callback"
+    ).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/oauth2/token", data=token_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        id_token = json.loads(resp.read())["id_token"]
+    payload = id_token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+
+
+@pytest.mark.parametrize("nonce", ["n-0S6_WzA2Mj", ""])
+def test_cognito_saml_federation_id_token_nonce(cognito_idp, nonce):
+    """The authorize nonce reaches the ID token of a SAML federation sign-in; no nonce, no claim."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    nonce_qs = f"&nonce={nonce}" if nonce else ""
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=s&scope=openid{nonce_qs}"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["RelayState"][0]
+
+    saml_resp = _build_mock_saml_response(
+        name_id="nonce@example.com",
+        attributes={"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress": "nonce@example.com"},
+    )
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse",
+        data=_urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        callback_location = e.headers.get("Location", "")
+
+    claims = _federation_id_claims(cid, callback_location)
+    assert claims.get("nonce") == (nonce or None)
+
+
+@pytest.mark.parametrize("nonce", ["n-0S6_WzA2Mj", ""])
+def test_cognito_oidc_federation_id_token_nonce(cognito_idp, nonce):
+    """The authorize nonce reaches the ID token of an OIDC federation sign-in; no nonce, no claim."""
+    token_url, _recorded, stop = _start_fake_oidc_idp(
+        {"sub": "user-nonce", "email": "nonce@example.com", "name": "Nonce"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url)
+        nonce_qs = f"&nonce={nonce}" if nonce else ""
+        authorize_url = (
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=s&scope=openid{nonce_qs}"
+        )
+        try:
+            _no_redirect_opener.open(authorize_url)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["state"][0]
+
+        try:
+            _no_redirect_opener.open(f"{ENDPOINT}/oauth2/idpresponse?code=idp-code&state={relay_state}")
+            assert False, "Expected 302 back to the app"
+        except urllib.error.HTTPError as e:
+            callback_location = e.headers.get("Location", "")
+
+        claims = _federation_id_claims(cid, callback_location)
+        assert claims.get("nonce") == (nonce or None)
+    finally:
+        stop()
