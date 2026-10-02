@@ -5475,6 +5475,7 @@ def _oauth2_authorize_federation(query_params):
     identity_provider = _qp(query_params, "identity_provider")
     state = _qp(query_params, "state")
     scope = _qp(query_params, "scope", "openid")
+    nonce = _qp(query_params, "nonce")
 
     if not client_id:
         return error_response_json("InvalidParameterException", "client_id is required.", 400)
@@ -5507,6 +5508,9 @@ def _oauth2_authorize_federation(query_params):
         "redirect_uri": redirect_uri,
         "state": state,
         "scope": scope,
+        # The app's nonce belongs in the ID token MiniStack issues to the app;
+        # it is not forwarded to the external IdP.
+        "nonce": nonce,
         "provider_name": identity_provider,
         "created_at": time.time(),
     }
@@ -5727,6 +5731,7 @@ def _saml2_idp_response(body: bytes, query_params):
         "sub": sub,
         "redirect_uri": redirect_uri,
         "scopes": relay.get("scope", "openid"),
+        "nonce": relay.get("nonce", ""),
         "created_at": time.time(),
     }
 
@@ -5957,6 +5962,7 @@ def _oauth2_idp_response(method, body, query_params):
         "sub": sub,
         "redirect_uri": redirect_uri,
         "scopes": relay.get("scope", "openid"),
+        "nonce": relay.get("nonce", ""),
         "created_at": time.time(),
         "_oidc_access_token": access_token,  # kept for /oauth2/userInfo passthrough
     }
@@ -6406,7 +6412,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
                                         trigger_source="TokenGeneration_HostedAuth")
             id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
-                                    trigger_source="TokenGeneration_HostedAuth")
+                                    trigger_source="TokenGeneration_HostedAuth",
+                                    nonce=code_data.get("nonce", ""))
             refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh")
 
             return json_response({
