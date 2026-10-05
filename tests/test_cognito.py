@@ -5362,7 +5362,7 @@ def test_cognito_admin_create_user_sends_invitation_email(cognito_idp):
     assert msg["Source"] == "no-reply@verificationemail.com"
 
 
-def _custom_message_pool(cognito_idp, lam, handler_code):
+def _custom_message_pool(cognito_idp, lam, handler_code, **pool_kwargs):
     fname = f"custommsg-{_uuid_mod.uuid4().hex[:8]}"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -5375,6 +5375,7 @@ def _custom_message_pool(cognito_idp, lam, handler_code):
     fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fname}"
     pid = cognito_idp.create_user_pool(
         PoolName=f"pool-{fname}", LambdaConfig={"CustomMessage": fn_arn},
+        **pool_kwargs,
     )["UserPool"]["Id"]
     return pid, fname
 
@@ -5417,6 +5418,36 @@ def test_cognito_custom_message_replaces_invitation_email(cognito_idp, lam):
         )
         msgs = _messages_to(email, "CognitoInvitationMessage")
         assert [m["Subject"] for m in msgs] == ["Hello invite", "Hello resend"]
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_cognito_custom_message_username_is_email_in_username_attributes_pool(cognito_idp, lam):
+    """The {username} left in the Lambda's emailMessage expands to the email,
+    while the event's userName stays the internal Username."""
+    handler = (
+        "def handler(event, context):\n"
+        "    p = event['request']\n"
+        "    event['response']['emailSubject'] = 'Hello'\n"
+        "    event['response']['emailMessage'] = (\n"
+        "        'name=' + p['usernameParameter'] + ' ' + p['codeParameter']\n"
+        "        + ' event=' + event['userName'])\n"
+        "    return event\n"
+    )
+    pid, fname = _custom_message_pool(
+        cognito_idp, lam, handler, UsernameAttributes=["email"],
+    )
+    try:
+        email = f"cmun-{_uuid_mod.uuid4().hex[:8]}@example.com"
+        user = cognito_idp.admin_create_user(
+            UserPoolId=pid, Username=email, TemporaryPassword="TempPw1!aa",
+        )["User"]
+        assert user["Username"] != email
+        msgs = _messages_to(email, "CognitoInvitationMessage")
+        assert len(msgs) == 1
+        body = msgs[0]["BodyText"] or msgs[0]["BodyHtml"]
+        assert body == f"name={email} TempPw1!aa event={user['Username']}"
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
         lam.delete_function(FunctionName=fname)
@@ -5551,6 +5582,44 @@ def test_cognito_without_custom_message_uses_default_invitation(cognito_idp):
         assert "invitee" in (msgs[0]["BodyText"] or msgs[0]["BodyHtml"])
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_cognito_invitation_username_is_email_in_username_attributes_pool(cognito_idp):
+    pid = cognito_idp.create_user_pool(
+        PoolName="InviteEmailUsernamePool",
+        UsernameAttributes=["email"],
+        AdminCreateUserConfig={
+            "InviteMessageTemplate": {
+                "EmailSubject": "Welcome",
+                "EmailMessage": "Your username is {username}, password {####}.",
+            },
+        },
+    )["UserPool"]["Id"]
+
+    email = f"uname-{_uuid_mod.uuid4().hex[:8]}@example.com"
+    user = cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username=email,
+        TemporaryPassword="TempPw1!aa",
+        DesiredDeliveryMediums=["EMAIL"],
+    )["User"]
+    assert user["Username"] != email
+
+    msgs = _messages_to(email, "CognitoInvitationMessage")
+    assert len(msgs) == 1
+    body = msgs[0]["BodyText"] or msgs[0]["BodyHtml"]
+    assert f"Your username is {email}," in body
+    assert user["Username"] not in body
+
+    cognito_idp.admin_create_user(
+        UserPoolId=pid,
+        Username=email,
+        MessageAction="RESEND",
+        DesiredDeliveryMediums=["EMAIL"],
+    )
+    resent = _messages_to(email, "CognitoInvitationMessage")
+    assert len(resent) == 2
+    assert f"Your username is {email}," in (resent[1]["BodyText"] or resent[1]["BodyHtml"])
 
 
 def test_cognito_admin_create_user_suppress_skips_email(cognito_idp):
