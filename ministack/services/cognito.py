@@ -3067,6 +3067,17 @@ def _expand_template(template: str, username: str, code: str) -> str:
     return template.replace("{username}", username or "").replace("{####}", code or "")
 
 
+def _template_username(pool: dict, username: str, attr_dict: dict) -> str:
+    """Value substituted for `{username}`. In a UsernameAttributes pool the
+    stored Username is an internal UUID, but the user-facing username is the
+    email / phone number they registered with."""
+    username_attrs = pool.get("UsernameAttributes") or []
+    for attr in ("email", "phone_number"):
+        if attr in username_attrs and (attr_dict or {}).get(attr):
+            return attr_dict[attr]
+    return username
+
+
 def _resolve_invite_template(pool: dict) -> tuple:
     """Return (subject, message_text, message_html) for invitation mail."""
     tpl = (pool.get("AdminCreateUserConfig") or {}).get("InviteMessageTemplate") or {}
@@ -3240,8 +3251,9 @@ def _render_invitation_message(pool, username, temp_password, attr_dict,
             "CustomMessage emailMessage must contain both {username} and {####}.")
     subject_tpl = custom.get("emailSubject") or subject_tpl
     body_tpl = custom_body or body_tpl
-    return (_expand_template(subject_tpl, username, temp_password),
-            _expand_template(body_tpl, username, temp_password))
+    display = _template_username(pool, username, attr_dict)
+    return (_expand_template(subject_tpl, display, temp_password),
+            _expand_template(body_tpl, display, temp_password))
 
 
 def _deliver_invitation_email(pool, username, attr_dict, subject, body):
@@ -3265,8 +3277,9 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
         "DefaultEmailOption"
     ) == "CONFIRM_WITH_LINK"
     subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
-    subject = _expand_template(subject_tpl, username, code)
-    body = _expand_template(body_tpl, username, code)
+    display = _template_username(pool, username, attr_dict)
+    subject = _expand_template(subject_tpl, display, code)
+    body = _expand_template(body_tpl, display, code)
     return _deliver_cognito_email(
         pool, email, subject, body,
         type_name="CognitoVerificationMessage",
@@ -3280,7 +3293,11 @@ def _send_email_otp(pool, username, attr_dict, code):
     return _deliver_cognito_email(
         pool, attr_dict["email"],
         _DEFAULT_EMAIL_OTP_SUBJECT,
-        _expand_template(_DEFAULT_EMAIL_OTP_MESSAGE, username, code),
+        _expand_template(
+            _DEFAULT_EMAIL_OTP_MESSAGE,
+            _template_username(pool, username, attr_dict),
+            code,
+        ),
         type_name="CognitoEmailOtpMessage",
         extra={"Username": username},
     )
