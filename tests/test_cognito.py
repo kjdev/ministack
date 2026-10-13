@@ -2477,6 +2477,39 @@ def test_cognito_oauth2_authorize_saml_redirect(cognito_idp):
         assert "RelayState=" in location
 
 
+def test_cognito_oauth2_authorize_saml_metadata_file(cognito_idp):
+    """MetadataFile only: SSO URL resolves from SingleSignOnService, preferring HTTP-Redirect."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    metadata = (
+        '<?xml version="1.0"?>'
+        '<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com/e">'
+        '<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+        ' Location="https://post.example.com/sso"/>'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"'
+        ' Location="https://redirect.example.com/sso"/>'
+        '</IDPSSODescriptor></EntityDescriptor>'
+    )
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="MetaSAML", ProviderType="SAML",
+        ProviderDetails={"MetadataFile": metadata},
+    )
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=MetaSAML&state=xyz123&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect, got 200"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302, f"Expected 302, got {e.code}"
+        location = e.headers.get("Location", "")
+        assert location.startswith("https://redirect.example.com/sso?")
+        assert "SAMLRequest=" in location
+
+
 def test_cognito_oauth2_authorize_invalid_client(cognito_idp):
     """GET /oauth2/authorize with unknown client_id returns 400."""
     url = f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id=nonexistent&redirect_uri=http://x&identity_provider=X"
