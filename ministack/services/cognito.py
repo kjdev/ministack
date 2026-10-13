@@ -1098,6 +1098,89 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
     }
 
 
+# Token claims Cognito owns; an IdP claim of the same name only becomes a user
+# attribute when AttributeMapping maps it explicitly.
+_FEDERATION_RESERVED_CLAIMS = frozenset(
+    ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"))
+
+
+def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
+    """Drop registered token claims from InboundFederation output unless mapped.
+
+    A Lambda that echoes the whole ``idToken`` back would otherwise land
+    ``iss`` / ``exp`` / ``iat`` in ``user_attrs``, and ``_fake_token`` copies
+    those over Cognito's own claims. Real Cognito only keeps mapped claims.
+    """
+    mapped = set(attr_mapping.values())
+    return {k: v for k, v in claims.items()
+            if k not in _FEDERATION_RESERVED_CLAIMS or k in mapped}
+
+
+class _InboundFederationRejected(Exception):
+    """Raised when an InboundFederation Lambda trigger fails the federated sign-in."""
+
+
+def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: str,
+                                       provider_name: str, provider_type: str,
+                                       attributes: dict) -> dict:
+    """Invoke the pool's InboundFederation Lambda before AttributeMapping.
+
+    Emulates ``InboundFederation_ExternalProvider``: the Lambda receives the
+    raw IdP data (``samlResponse`` as a SAML Attribute name -> value map, or
+    ``idToken`` / ``userInfo`` claims) and returns
+    ``response.userAttributesToMap`` keyed by IdP claim name, which replaces
+    the IdP's own value for that claim as the AttributeMapping input.
+    Fail-closed like PreSignUp: a Lambda failure aborts the sign-in.
+
+    Returns ``{}`` when the pool has no ``LambdaConfig.InboundFederation``.
+    """
+    pool = _user_pools.get(pool_id)
+    cfg = ((pool or {}).get("LambdaConfig") or {}).get("InboundFederation")
+    arn = cfg.get("LambdaArn") if isinstance(cfg, dict) else None
+    if not arn:
+        return {}
+
+    event = {
+        "version": "1",
+        "triggerSource": "InboundFederation_ExternalProvider",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+        "request": {
+            "providerName": provider_name,
+            "providerType": provider_type,
+            "attributes": attributes,
+        },
+        "response": {"userAttributesToMap": {}},
+    }
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"InboundFederation Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("InboundFederation Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _InboundFederationRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = result.get("body") or "InboundFederation Lambda rejected the request."
+        logger.info("InboundFederation Lambda rejected sign-in for pool %s user %s: %s",
+                    pool_id, username, reason)
+        raise _InboundFederationRejected(str(reason))
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    to_map = (_extract_trigger_response(payload) or {}).get("userAttributesToMap")
+    if not isinstance(to_map, dict):
+        return {}
+    return {str(k): str(v) for k, v in to_map.items()
+            if isinstance(v, (str, int, float, bool))}
+
+
 def _build_presignup_event(pool_id: str, client_id: str, username: str,
                             user_attrs: dict, trigger_source: str) -> dict:
     """Construct the event payload AWS sends to a PreSignUp Lambda.
@@ -6061,8 +6144,19 @@ def _saml2_idp_response(body: bytes, query_params):
     # Apply attribute mapping: IdP claim name → Cognito attribute name
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
+    idp_attrs = dict(saml_data.get("attributes", {}))
+    try:
+        idp_attrs.update(_drop_unmapped_reserved_claims(
+            _apply_inbound_federation_trigger(
+                pool_id, client_id, name_id, provider_name, "SAML",
+                {"samlResponse": saml_data["attributes"]}),
+            attr_mapping))
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected SAML sign-in for %s: %s",
+                    name_id, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
     user_attrs = {}
-    for idp_claim, value in saml_data.get("attributes", {}).items():
+    for idp_claim, value in idp_attrs.items():
         cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
         user_attrs[cognito_attr] = value
 
@@ -6285,14 +6379,22 @@ def _oauth2_idp_response(method, body, query_params):
     # as the SAML branch.
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}
+    idp_claims = {k: str(v) for k, v in claims.items()
+                  if k not in _FEDERATION_RESERVED_CLAIMS
+                  and isinstance(v, (str, int, float, bool))}
+    try:
+        idp_claims.update(_drop_unmapped_reserved_claims(
+            _apply_inbound_federation_trigger(
+                pool_id, client_id, str(claims.get("sub") or ""), provider_name, "OIDC",
+                {"idToken": claims}),
+            attr_mapping))
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
+                    claims.get("sub"), e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
     user_attrs = {}
-    for idp_claim, value in claims.items():
-        if idp_claim in ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"):
-            continue
-        if not isinstance(value, (str, int, float, bool)):
-            continue
-        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
-        user_attrs[cognito_attr] = str(value)
+    for idp_claim, value in idp_claims.items():
+        user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value
 
     # Stable identifier: prefer `sub` from id_token, fall back to `email` or
     # a generated UUID so users can be re-found on subsequent logins.
